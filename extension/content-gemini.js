@@ -27,6 +27,12 @@
         const last = segs[segs.length - 1];
         return typeof last === 'string' && last.length > 0 && /^[A-Za-z0-9_-]+$/.test(last);
       }
+      // Support public share route /share/<id>
+      const iShare = segs.indexOf('share');
+      if (iShare !== -1) {
+        const slug = segs[iShare + 1];
+        return typeof slug === 'string' && slug.length > 0 && /^[A-Za-z0-9_-]+$/.test(slug);
+      }
       return false;
     } catch { return false; }
   }
@@ -51,6 +57,12 @@
           if (/^[A-Za-z0-9_-]+$/.test(tail[j])) return tail[j];
         }
         return tail[tail.length - 1] || null;
+      }
+      // /share/<id>  → namespace to avoid collision with /app/<id>
+      const iShare = segs.indexOf('share');
+      if (iShare !== -1) {
+        const slug = segs[iShare + 1];
+        if (slug && /^[A-Za-z0-9_-]+$/.test(slug)) return `share:${slug}`;
       }
       return null;
     } catch { return null; }
