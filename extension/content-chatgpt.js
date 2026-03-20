@@ -124,7 +124,7 @@ class TimelineManager {
     }
     
     async findCriticalElements() {
-        const firstTurn = await this.waitForElement('article[data-turn-id]');
+        const firstTurn = await this.waitForElement('[data-turn-id]');
         if (!firstTurn) return false;
         
         this.conversationContainer = firstTurn.parentElement;
@@ -229,7 +229,7 @@ class TimelineManager {
         this.perfStart('recalc');
         if (!this.conversationContainer || !this.ui.timelineBar || !this.scrollContainer) return;
 
-        const userTurnElements = this.conversationContainer.querySelectorAll('article[data-turn="user"]');
+        const userTurnElements = this.conversationContainer.querySelectorAll('[data-turn="user"]');
         // Reset visible window to avoid cleaning with stale indices after rebuild
         this.visibleRange = { start: 0, end: -1 };
         // If the conversation is transiently empty (branch switching), don't wipe UI immediately
@@ -348,7 +348,7 @@ class TimelineManager {
 
     // Ensure our conversation/scroll containers are still current after DOM replacements
     ensureContainersUpToDate() {
-        const first = document.querySelector('article[data-turn-id]');
+        const first = document.querySelector('[data-turn-id]');
         if (!first) return;
         const newConv = first.parentElement;
         if (newConv && newConv !== this.conversationContainer) {
@@ -406,7 +406,7 @@ class TimelineManager {
         if (!this.intersectionObserver || !this.conversationContainer) return;
         this.intersectionObserver.disconnect();
         this.visibleUserTurns.clear();
-        const userTurns = this.conversationContainer.querySelectorAll('article[data-turn="user"][data-turn-id]');
+        const userTurns = this.conversationContainer.querySelectorAll('[data-turn="user"][data-turn-id]');
         userTurns.forEach(el => this.intersectionObserver.observe(el));
     }
 
@@ -420,7 +420,7 @@ class TimelineManager {
                     return;
                 }
                 const targetId = dot.dataset.targetTurnId;
-                const targetElement = this.conversationContainer.querySelector(`article[data-turn-id="${targetId}"]`);
+                const targetElement = this.conversationContainer.querySelector(`[data-turn-id="${targetId}"]`);
                 if (targetElement) {
                     // Only scroll; let scroll-based computation set active to avoid double-flash
                     this.smoothScrollTo(targetElement);
@@ -1484,7 +1484,7 @@ function handleUrlChange() {
 }
 
 const initialObserver = new MutationObserver(() => {
-    if (document.querySelector('article[data-turn-id]')) {
+    if (document.querySelector('[data-turn-id]')) {
         if (isConversationRoute() && (timelineActive && providerEnabled)) { initializeTimeline(); }
         try { initialObserver.disconnect(); } catch {}
         // Create a single managed pageObserver
@@ -1512,7 +1512,7 @@ try {
         try { document.querySelector('.timeline-left-slider')?.remove(); } catch {}
         try { document.getElementById('chatgpt-timeline-tooltip')?.remove(); } catch {}
       } else {
-        if (isConversationRoute() && document.querySelector('article[data-turn-id]')) {
+        if (isConversationRoute() && document.querySelector('[data-turn-id]')) {
           initializeTimeline();
         }
       }
@@ -1539,7 +1539,7 @@ try {
         try { document.querySelector('.timeline-left-slider')?.remove(); } catch {}
         try { document.getElementById('chatgpt-timeline-tooltip')?.remove(); } catch {}
       } else {
-        if (isConversationRoute() && document.querySelector('article[data-turn-id]')) {
+        if (isConversationRoute() && document.querySelector('[data-turn-id]')) {
           initializeTimeline();
         }
       }
