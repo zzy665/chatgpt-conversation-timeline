@@ -27,6 +27,14 @@
     },
     {
       "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["fiber-bridge-chatgpt.js"],
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "https://chat.deepseek.com/*"
       ],
       "js": ["content-deepseek.js"],

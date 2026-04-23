@@ -61,6 +61,8 @@ class TimelineManager {
         
         this.debouncedRecalculateAndRender = this.debounce(this.recalculateAndRenderMarkers, 350);
 
+        // Summary cache: retain text when ChatGPT virtualizes off-screen elements
+        this.summaryCache = new Map();
         // Star/Highlight feature state
         this.starred = new Set();
         this.markerMap = new Map();
@@ -126,8 +128,19 @@ class TimelineManager {
     async findCriticalElements() {
         const firstTurn = await this.waitForElement('[data-turn-id]');
         if (!firstTurn) return false;
-        
-        this.conversationContainer = firstTurn.parentElement;
+
+        // Find lowest common ancestor that contains ALL turn elements
+        const allTurns = document.querySelectorAll('[data-turn-id]');
+        let root = firstTurn.parentElement;
+        while (root && root !== document.body) {
+            let allInside = true;
+            for (let i = 0; i < allTurns.length; i++) {
+                if (!root.contains(allTurns[i])) { allInside = false; break; }
+            }
+            if (allInside) break;
+            root = root.parentElement;
+        }
+        this.conversationContainer = root || firstTurn.parentElement;
         if (!this.conversationContainer) return false;
 
         let parent = this.conversationContainer;
@@ -243,6 +256,8 @@ class TimelineManager {
             return;
         }
         if (this.zeroTurnsTimer) { try { clearTimeout(this.zeroTurnsTimer); } catch {} this.zeroTurnsTimer = null; }
+        // Extract React fiber text for virtualized elements before building markers
+        try { this.extractFiberTexts(); } catch {}
         // Clear old dots from track/content (now that we know content exists)
         (this.ui.trackContent || this.ui.timelineBar).querySelectorAll('.timeline-dot').forEach(n => n.remove());
 
@@ -269,7 +284,7 @@ class TimelineManager {
             const m = {
                 id: el.dataset.turnId,
                 element: el,
-                summary: this.normalizeText(el.textContent || ''),
+                summary: this.resolveSummary(el),
                 n,
                 baseN: n,
                 dotElement: null,
@@ -350,7 +365,17 @@ class TimelineManager {
     ensureContainersUpToDate() {
         const first = document.querySelector('[data-turn-id]');
         if (!first) return;
-        const newConv = first.parentElement;
+        // Find lowest common ancestor containing all turns (same logic as findCriticalElements)
+        const allTurns = document.querySelectorAll('[data-turn-id]');
+        let newConv = first.parentElement;
+        while (newConv && newConv !== document.body) {
+            let allInside = true;
+            for (let i = 0; i < allTurns.length; i++) {
+                if (!newConv.contains(allTurns[i])) { allInside = false; break; }
+            }
+            if (allInside) break;
+            newConv = newConv.parentElement;
+        }
         if (newConv && newConv !== this.conversationContainer) {
             // Rebind observers and listeners to the new conversation root
             this.rebindConversationContainer(newConv);
@@ -698,6 +723,41 @@ class TimelineManager {
         } catch {
             return '';
         }
+    }
+
+    // Trigger the MAIN-world bridge script (fiber-bridge-chatgpt.js) to read React
+    // fiber data for virtualized elements. Data flows back via CustomEvent.detail
+    // into summaryCache — zero DOM modifications, zero traces on the page.
+    extractFiberTexts() {
+        try {
+            let received = false;
+            const handler = (e) => {
+                received = true;
+                const data = e.detail;
+                if (!data || typeof data !== 'object') return;
+                for (const id of Object.keys(data)) {
+                    const text = this.normalizeText(data[id] || '');
+                    if (text) this.summaryCache.set(id, text);
+                }
+            };
+            document.addEventListener('timeline-fiber-result', handler, { once: true });
+            document.dispatchEvent(new CustomEvent('timeline-extract-fiber'));
+            // DOM events are synchronous — if bridge responded, handler already ran.
+            // If not (bridge not loaded yet), clean up the orphaned listener.
+            if (!received) {
+                document.removeEventListener('timeline-fiber-result', handler);
+            }
+        } catch {}
+    }
+
+    // Two-tier summary resolution: DOM text → summaryCache (populated by fiber bridge)
+    resolveSummary(el) {
+        const id = el.dataset.turnId;
+        // Priority 1: DOM text (most reliable when element is not virtualized)
+        const domText = this.normalizeText(el.textContent || '');
+        if (domText) { this.summaryCache.set(id, domText); return domText; }
+        // Priority 2: cached value (filled by fiber bridge or previous DOM reads)
+        return this.summaryCache.get(id) || '';
     }
 
     getTrackPadding() {
@@ -1316,6 +1376,7 @@ class TimelineManager {
         this.ui.sliderHandle = null;
         this.ui = { timelineBar: null, tooltip: null };
         this.markers = [];
+        this.summaryCache.clear();
         this.activeTurnId = null;
         this.scrollContainer = null;
         this.conversationContainer = null;
