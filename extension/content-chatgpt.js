@@ -22,6 +22,7 @@ class TimelineManager {
         this.onTimelineBarFocusOut = null;
         this.onWindowResize = null;
         this.onTimelineWheel = null;
+        this.onTimelinePointerMove = null;
         this.scrollRafId = null;
         this.smoothScrollRafId = null;
         this.smoothScrollSession = 0;
@@ -47,18 +48,25 @@ class TimelineManager {
         this.measureCanvas = null;
         this.measureCtx = null;
         this.showRafId = null;
+        this.tooltipMoveRafId = null;
+        this.pendingTooltipDot = null;
         // Long-canvas scrollable track (Linked mode)
         this.ui.track = null;
         this.ui.trackContent = null;
         this.scale = 1;
         this.contentHeight = 0;
         this.yPositions = [];
+        this.timelineHitTop = NaN;
+        this.hoverDistanceThreshold = 42;
+        this.hoverWidths = [36, 28, 21, 15, 9];
+        this.hoverOpacities = [1, 0.88, 0.72, 0.56, 0.42];
+        this.hoverEffectRadius = this.hoverWidths.length - 1;
         this.markerScrollPositions = [];
         this.visibleRange = { start: 0, end: -1 };
         this.firstUserTurnOffset = 0;
         this.contentSpanPx = 1;
-        this.usePixelTop = false; // fallback when CSS var positioning is unreliable
-        this._cssVarTopSupported = null;
+        this.usePixelTop = true; // Codex-style compact layout uses explicit pixel positions.
+        this._cssVarTopSupported = true;
         // Left-side slider (only controls timeline scroll)
         this.ui.slider = null;
         this.ui.sliderHandle = null;
@@ -82,6 +90,8 @@ class TimelineManager {
         // Star/Highlight feature state
         this.starred = new Set();
         this.markerMap = new Map();
+        this.hoveredMarkerIndex = -1;
+        this.tooltipMarkerId = null;
         this.conversationId = this.extractConversationIdFromPath(location.pathname);
         // Long-press gesture state
         this.longPressDuration = 550; // ms
@@ -94,6 +104,7 @@ class TimelineManager {
         this.suppressActiveUntil = 0;
         // Cross-tab sync
         this.onStorage = null;
+        this.hoverPaintedIndices = new Set();
     }
 
     perfStart(name) {
@@ -252,7 +263,8 @@ class TimelineManager {
         this.perfStart('recalc');
         if (!this.conversationContainer || !this.ui.timelineBar || !this.scrollContainer) return;
 
-        const userTurnElements = this.conversationContainer.querySelectorAll('[data-turn="user"]');
+        const allTurnElements = Array.from(this.conversationContainer.querySelectorAll('[data-turn-id]'));
+        const userTurnElements = allTurnElements.filter(el => el?.dataset?.turn === 'user');
         // Reset visible window to avoid cleaning with stale indices after rebuild
         this.visibleRange = { start: 0, end: -1 };
         // If the conversation is transiently empty (branch switching), don't wipe UI immediately
@@ -276,12 +288,9 @@ class TimelineManager {
         const firstTurnOffset = measuredPositions[0] || 0;
         const lastTurnOffset = measuredPositions[measuredPositions.length - 1] || firstTurnOffset;
         const contentSpan = Math.max(1, lastTurnOffset - firstTurnOffset);
-        const previousRatiosById = new Map(this.markers.map(marker => [marker.id, marker.baseN ?? marker.n ?? 0]));
-        const previousRatios = turnElements.map(el => previousRatiosById.get(el.dataset.turnId));
-        const markerRatios = InitialJumpUtils.normalizeMarkerRatios({
-            positions: measuredPositions,
-            previous: previousRatios,
-            preservePreviousOnSkew: previousRatiosById.size > 0
+        const markerRatios = turnElements.map((_, index) => {
+            if (turnElements.length <= 1) return 0.5;
+            return index / Math.max(1, turnElements.length - 1);
         });
 
         // Cache for scroll mapping
@@ -294,10 +303,13 @@ class TimelineManager {
         this.markers = turnElements.map((el, index) => {
             let n = markerRatios[index];
             n = Math.max(0, Math.min(1, n));
+            const pair = this.resolveTurnPairSummary(el, allTurnElements);
             const m = {
                 id: el.dataset.turnId,
                 element: el,
-                summary: this.resolveSummary(el),
+                summary: pair.question,
+                answerSummary: pair.answer,
+                tooltipLabel: this.composeTooltipLabel(pair.question, pair.answer),
                 n,
                 baseN: n,
                 dotElement: null,
@@ -309,6 +321,14 @@ class TimelineManager {
         });
         // Bump version after markers are rebuilt to invalidate concurrent passes
         this.markersVersion++;
+        if (this.hoveredMarkerIndex >= this.markers.length) {
+            this.hoveredMarkerIndex = -1;
+            this.hoverPaintedIndices.clear();
+        } else if (this.hoveredMarkerIndex >= 0) {
+            this.hoverPaintedIndices = new Set(this.getHoverPaintIndices(this.hoveredMarkerIndex));
+        } else {
+            this.hoverPaintedIndices.clear();
+        }
 
         // Compute geometry and virtualize render
         this.updateTimelineGeometry();
@@ -441,7 +461,7 @@ class TimelineManager {
 
     setupEventListeners() {
         this.onTimelineBarClick = (e) => {
-            const dot = e.target.closest('.timeline-dot');
+            const dot = this.getDotFromPointerEvent(e, true);
             if (dot) {
                 const now = Date.now();
                 if (now < (this.suppressClickUntil || 0)) {
@@ -459,7 +479,7 @@ class TimelineManager {
         this.ui.timelineBar.addEventListener('click', this.onTimelineBarClick);
         // Long-press gesture on dots (delegated on bar)
         this.onPointerDown = (ev) => {
-            const dot = ev.target.closest?.('.timeline-dot');
+            const dot = this.getDotFromPointerEvent(ev, true);
             if (!dot) return;
             if (typeof ev.button === 'number' && ev.button !== 0) return; // left button only
             this.cancelLongPress();
@@ -490,7 +510,7 @@ class TimelineManager {
         this.onPointerUp = () => { this.cancelLongPress(); };
         this.onPointerCancel = () => { this.cancelLongPress(); };
         this.onPointerLeave = (ev) => {
-            const dot = ev.target.closest?.('.timeline-dot');
+            const dot = this.getDotFromPointerEvent(ev, true);
             if (dot && dot === this.pressTargetDot) this.cancelLongPress();
         };
         try {
@@ -508,23 +528,50 @@ class TimelineManager {
 
         // Tooltip interactions (delegated)
         this.onTimelineBarOver = (e) => {
-            const dot = e.target.closest('.timeline-dot');
-            if (dot) this.showTooltipForDot(dot);
+            const index = this.findNearestMarkerIndexByClientY(e.clientY);
+            if (index < 0) return;
+            this.applyHoverProximityForIndex(index);
+            const dot = this.markers[index]?.dotElement || this.getDotFromPointerEvent(e, true);
+            if (dot) this.scheduleTooltipForDot(dot);
+        };
+        this.onTimelinePointerMove = (e) => {
+            const index = this.findNearestMarkerIndexByClientY(e.clientY);
+            if (index < 0) {
+                this.hideTooltip();
+                this.clearHoverProximity();
+                return;
+            }
+            this.applyHoverProximityForIndex(index);
+            const marker = this.markers[index];
+            const dot = marker?.dotElement;
+            if (dot && this.tooltipMarkerId !== marker.id) {
+                this.scheduleTooltipForDot(dot);
+            }
         };
         this.onTimelineBarOut = (e) => {
             const fromDot = e.target.closest('.timeline-dot');
             const toDot = e.relatedTarget?.closest?.('.timeline-dot');
-            if (fromDot && !toDot) this.hideTooltip();
+            const stillInBar = e.relatedTarget && this.ui.timelineBar?.contains?.(e.relatedTarget);
+            if (fromDot && !toDot && !stillInBar) {
+                this.hideTooltip();
+                this.clearHoverProximity();
+            }
         };
         this.onTimelineBarFocusIn = (e) => {
-            const dot = e.target.closest('.timeline-dot');
-            if (dot) this.showTooltipForDot(dot);
+            const dot = this.getDotFromPointerEvent(e);
+            if (!dot) return;
+            this.applyHoverProximityForDot(dot);
+            this.showTooltipForDot(dot);
         };
         this.onTimelineBarFocusOut = (e) => {
-            const dot = e.target.closest('.timeline-dot');
-            if (dot) this.hideTooltip();
+            const dot = this.getDotFromPointerEvent(e);
+            if (dot) {
+                this.hideTooltip();
+                this.clearHoverProximity();
+            }
         };
         this.ui.timelineBar.addEventListener('mouseover', this.onTimelineBarOver);
+        this.ui.timelineBar.addEventListener('pointermove', this.onTimelinePointerMove, { passive: true });
         this.ui.timelineBar.addEventListener('mouseout', this.onTimelineBarOut);
         this.ui.timelineBar.addEventListener('focusin', this.onTimelineBarFocusIn);
         this.ui.timelineBar.addEventListener('focusout', this.onTimelineBarFocusOut);
@@ -532,7 +579,7 @@ class TimelineManager {
         // Slider visibility on hover (time axis or slider itself) with stable refs
         // Define and persist handlers so we can remove them in destroy()
         this.onBarEnter = () => this.showSlider();
-        this.onBarLeave = () => this.hideSliderDeferred();
+        this.onBarLeave = () => { this.hideSliderDeferred(); this.hideTooltip(); this.clearHoverProximity(); };
         this.onSliderEnter = () => this.showSlider();
         this.onSliderLeave = () => this.hideSliderDeferred();
         try {
@@ -546,30 +593,9 @@ class TimelineManager {
 
         // Reposition tooltip on resize
         this.onWindowResize = () => {
-            if (this.ui.tooltip?.classList.contains('visible')) {
-                const activeDot = this.ui.timelineBar.querySelector('.timeline-dot:hover, .timeline-dot:focus');
-                if (activeDot) {
-                    // Re-run T0->T1 to avoid layout during animation
-                    const tip = this.ui.tooltip;
-                    tip.classList.remove('visible');
-                    let fullText = (activeDot.getAttribute('aria-label') || '').trim();
-                    try {
-                        const id = activeDot.dataset.targetTurnId;
-                        if (id && this.starred.has(id)) fullText = `★ ${fullText}`;
-                    } catch {}
-                    const p = this.computePlacementInfo(activeDot);
-                    const layout = this.truncateToThreeLines(fullText, p.width, true);
-                    tip.textContent = layout.text;
-                    this.placeTooltipAt(activeDot, p.placement, p.width, layout.height);
-                    if (this.showRafId !== null) {
-                        try { cancelAnimationFrame(this.showRafId); } catch {}
-                        this.showRafId = null;
-                    }
-                    this.showRafId = requestAnimationFrame(() => {
-                        this.showRafId = null;
-                        tip.classList.add('visible');
-                    });
-                }
+            if (this.ui.tooltip?.classList.contains('visible') && this.tooltipMarkerId) {
+                const marker = this.markerMap.get(this.tooltipMarkerId);
+                if (marker?.dotElement) this.refreshTooltipForDot(marker.dotElement);
             }
             // Update long-canvas geometry and virtualization
             this.updateTimelineGeometry();
@@ -1154,9 +1180,28 @@ class TimelineManager {
             // Strip only if it appears at the very start
             s = s.replace(/^\s*(you\s*said\s*[:：]?\s*)/i, '');
             s = s.replace(/^\s*((你说|您说|你說|您說)\s*[:：]?\s*)/, '');
+            s = s.replace(/^\s*((大模型|模型|助手|助理|ChatGPT|Assistant|AI)\s*(说|說|said)\s*[:：]?\s*)/i, '');
+            s = s.replace(/^\s*已\s*思考\s*/i, '思考 ');
+            const thinking = this.splitThinkingPrefix(s);
+            if (thinking) s = thinking.rest ? `${thinking.prefix} ${thinking.rest}` : thinking.prefix;
             return s;
         } catch {
             return '';
+        }
+    }
+
+    splitThinkingPrefix(text) {
+        try {
+            const s = String(text || '').replace(/\s+/g, ' ').trim();
+            const durationUnit = '(?:milliseconds?|seconds?|minutes?|hours?|secs?|mins?|hrs?|毫秒|秒钟|秒|分钟|分|小时|时|ms|sec|s|min|m|hr|h)';
+            const re = new RegExp(`^(思考\\s*(?:约\\s*)?(?:(?:\\d+(?:\\.\\d+)?\\s*${durationUnit})\\s*)+)(.*)$`, 'i');
+            const match = s.match(re);
+            if (!match) return null;
+            const prefix = match[1].trim().replace(/^思考(?=\S)/, '思考 ');
+            const rest = (match[2] || '').trimStart();
+            return prefix ? { prefix, rest } : null;
+        } catch {
+            return null;
         }
     }
 
@@ -1185,14 +1230,97 @@ class TimelineManager {
         } catch {}
     }
 
-    // Two-tier summary resolution: DOM text → summaryCache (populated by fiber bridge)
+    // Two-tier summary resolution: DOM text -> summaryCache (populated by fiber bridge)
     resolveSummary(el) {
-        const id = el.dataset.turnId;
+        const id = el?.dataset?.turnId;
+        if (!id) return '';
         // Priority 1: DOM text (most reliable when element is not virtualized)
         const domText = this.normalizeText(el.textContent || '');
         if (domText) { this.summaryCache.set(id, domText); return domText; }
         // Priority 2: cached value (filled by fiber bridge or previous DOM reads)
         return this.summaryCache.get(id) || '';
+    }
+
+    findAssistantAfterUser(userEl, allTurnElements = []) {
+        try {
+            const turns = Array.isArray(allTurnElements) && allTurnElements.length
+                ? allTurnElements
+                : Array.from(this.conversationContainer?.querySelectorAll?.('[data-turn-id]') || []);
+            const start = turns.indexOf(userEl);
+            if (start < 0) return null;
+            for (let i = start + 1; i < turns.length; i++) {
+                const turn = turns[i];
+                const role = turn?.dataset?.turn;
+                if (role === 'assistant') return turn;
+                if (role === 'user') return null;
+            }
+        } catch {}
+        return null;
+    }
+
+    resolveTurnPairSummary(userEl, allTurnElements = []) {
+        const question = this.resolveSummary(userEl);
+        const assistantEl = this.findAssistantAfterUser(userEl, allTurnElements);
+        const answer = assistantEl ? this.resolveSummary(assistantEl) : '';
+        return { question, answer };
+    }
+
+    composeTooltipLabel(question, answer) {
+        const q = this.normalizeText(question || '');
+        const a = this.normalizeText(answer || '');
+        if (q && a) return `${q}\n${a}`;
+        return q || a || '';
+    }
+
+    getMarkerTooltipLabel(marker) {
+        if (!marker) return '';
+        const label = marker.tooltipLabel || this.composeTooltipLabel(marker.summary, marker.answerSummary);
+        return marker.starred ? `★ ${label}` : label;
+    }
+
+    renderTooltipContent(tip, marker) {
+        if (!tip) return;
+        tip.textContent = '';
+        const starred = !!marker?.starred;
+        const question = this.normalizeText(marker?.summary || marker?.tooltipLabel || '');
+        const answer = this.normalizeText(marker?.answerSummary || '');
+
+        const q = document.createElement('div');
+        q.className = 'timeline-tooltip-question';
+        q.textContent = `${starred ? '★ ' : ''}${question || answer || ''}`;
+        tip.appendChild(q);
+
+        if (answer) {
+            const a = document.createElement('div');
+            a.className = 'timeline-tooltip-answer';
+            const thinking = this.splitThinkingPrefix(answer);
+            if (thinking) {
+                const prefix = document.createElement('span');
+                prefix.className = 'timeline-tooltip-thinking';
+                prefix.textContent = thinking.prefix;
+                a.appendChild(prefix);
+                if (thinking.rest) a.appendChild(document.createTextNode(` ${thinking.rest}`));
+            } else {
+                a.textContent = answer;
+            }
+            tip.appendChild(a);
+        }
+    }
+
+    measureTooltipHeight(tip, width) {
+        if (!tip) return 0;
+        try {
+            tip.style.width = `${Math.floor(width)}px`;
+            tip.style.height = 'auto';
+            const lineH = this.getCSSVarNumber(tip, '--timeline-tooltip-lh', 18);
+            const padY = this.getCSSVarNumber(tip, '--timeline-tooltip-pad-y', 10);
+            const borderW = this.getCSSVarNumber(tip, '--timeline-tooltip-border-w', 1);
+            const maxH = Math.round(5 * lineH + 2 * padY + 2 * borderW + 4);
+            const measured = Math.ceil(tip.scrollHeight || tip.offsetHeight || maxH);
+            return Math.max(1, Math.min(measured, maxH));
+        } catch {
+            return 108;
+        }
     }
 
     getTrackPadding() {
@@ -1243,24 +1371,21 @@ class TimelineManager {
     // (Removed) Idle min-gap reapply; ChatGPT keeps min-gap solely in updateTimelineGeometry
 
     showTooltipForDot(dot) {
-        if (!this.ui.tooltip) return;
+        if (!this.ui.tooltip || !dot) return;
+        this.cancelScheduledTooltip();
         try { if (this.tooltipHideTimer) { clearTimeout(this.tooltipHideTimer); this.tooltipHideTimer = null; } } catch {}
-        // T0: compute + write geometry while hidden
+        const marker = this.getMarkerForDot(dot);
+        if (!marker) return;
+
         const tip = this.ui.tooltip;
         tip.classList.remove('visible');
-        let fullText = (dot.getAttribute('aria-label') || '').trim();
-        try {
-            const id = dot.dataset.targetTurnId;
-            if (id && this.starred.has(id)) {
-                fullText = `★ ${fullText}`;
-            }
-        } catch {}
+        this.renderTooltipContent(tip, marker);
         const p = this.computePlacementInfo(dot);
-        const layout = this.truncateToThreeLines(fullText, p.width, true);
-        tip.textContent = layout.text;
-        this.placeTooltipAt(dot, p.placement, p.width, layout.height);
+        const height = this.measureTooltipHeight(tip, p.width);
+        this.placeTooltipAt(dot, p.placement, p.width, height);
         tip.setAttribute('aria-hidden', 'false');
-        // T1: next frame add visible for non-geometric animation only
+        this.tooltipMarkerId = marker.id;
+
         if (this.showRafId !== null) {
             try { cancelAnimationFrame(this.showRafId); } catch {}
             this.showRafId = null;
@@ -1271,16 +1396,185 @@ class TimelineManager {
         });
     }
 
+    scheduleTooltipForDot(dot) {
+        if (!this.ui.tooltip || !dot) return;
+        this.pendingTooltipDot = dot;
+        if (this.tooltipMoveRafId !== null) return;
+        this.tooltipMoveRafId = requestAnimationFrame(() => {
+            this.tooltipMoveRafId = null;
+            const nextDot = this.pendingTooltipDot;
+            this.pendingTooltipDot = null;
+            if (!nextDot || !nextDot.isConnected) return;
+            if (this.ui.tooltip?.classList.contains('visible')) {
+                this.refreshTooltipForDot(nextDot);
+            } else {
+                this.showTooltipForDot(nextDot);
+            }
+        });
+    }
+
+    cancelScheduledTooltip() {
+        if (this.tooltipMoveRafId !== null) {
+            try { cancelAnimationFrame(this.tooltipMoveRafId); } catch {}
+            this.tooltipMoveRafId = null;
+        }
+        this.pendingTooltipDot = null;
+    }
+
     hideTooltip(immediate = false) {
         if (!this.ui.tooltip) return;
+        this.cancelScheduledTooltip();
         const doHide = () => {
             this.ui.tooltip.classList.remove('visible');
             this.ui.tooltip.setAttribute('aria-hidden', 'true');
+            this.tooltipMarkerId = null;
             this.tooltipHideTimer = null;
         };
         if (immediate) return doHide();
         try { if (this.tooltipHideTimer) { clearTimeout(this.tooltipHideTimer); } } catch {}
         this.tooltipHideTimer = setTimeout(doHide, this.tooltipHideDelay);
+    }
+
+    getMarkerForDot(dot) {
+        const id = String(dot?.dataset?.targetTurnId || '').trim();
+        if (!id) return null;
+        return this.markerMap.get(id) || null;
+    }
+
+    getMarkerIndexForDot(dot) {
+        const raw = Number(dot?.dataset?.markerIndex);
+        if (Number.isInteger(raw) && raw >= 0 && raw < this.markers.length) return raw;
+        const marker = this.getMarkerForDot(dot);
+        return marker ? this.markers.indexOf(marker) : -1;
+    }
+
+    getDotFromPointerEvent(event, preferNearest = false) {
+        const targetDot = event?.target?.closest?.('.timeline-dot') || null;
+        const y = Number(event?.clientY);
+        const nearestDot = Number.isFinite(y) ? this.findNearestVisibleDotByClientY(y) : null;
+        return preferNearest ? (nearestDot || targetDot) : (targetDot || nearestDot);
+    }
+
+    getTimelineTrackTop() {
+        const cached = Number(this.timelineHitTop);
+        if (Number.isFinite(cached)) return cached;
+        try {
+            const top = this.ui.track?.getBoundingClientRect?.().top;
+            if (Number.isFinite(top)) {
+                this.timelineHitTop = top;
+                return top;
+            }
+        } catch {}
+        return NaN;
+    }
+
+    findNearestMarkerIndexByClientY(clientY) {
+        const y = Number(clientY);
+        if (!Number.isFinite(y) || !this.yPositions.length || !this.ui.track) return -1;
+        const trackTop = this.getTimelineTrackTop();
+        if (!Number.isFinite(trackTop)) return -1;
+        const contentY = y - trackTop + (this.ui.track.scrollTop || 0);
+        return InitialJumpUtils.selectNearestIndexByY({
+            positions: this.yPositions,
+            value: contentY,
+            threshold: this.hoverDistanceThreshold
+        });
+    }
+
+    findNearestVisibleDotByClientY(clientY) {
+        const index = this.findNearestMarkerIndexByClientY(clientY);
+        const dot = index >= 0 ? this.markers[index]?.dotElement : null;
+        if (dot?.isConnected) return dot;
+        if (index < 0) return null;
+        return this.findNearestVisibleDotByClientYSlow(clientY);
+    }
+
+    findNearestVisibleDotByClientYSlow(clientY) {
+        let best = null;
+        let bestDistance = Infinity;
+        for (let i = 0; i < this.markers.length; i++) {
+            const dot = this.markers[i]?.dotElement;
+            if (!dot || !dot.isConnected) continue;
+            try {
+                const rect = dot.getBoundingClientRect();
+                const center = rect.top + rect.height / 2;
+                const distance = Math.abs(center - clientY);
+                if (distance < bestDistance) {
+                    best = dot;
+                    bestDistance = distance;
+                }
+            } catch {}
+        }
+        return bestDistance <= this.hoverDistanceThreshold ? best : null;
+    }
+
+    getHoverPaintIndices(center) {
+        return InitialJumpUtils.selectHoverPaintIndices({
+            center,
+            count: this.markers.length,
+            radius: this.hoverEffectRadius
+        });
+    }
+
+    applyHoverStateToDot(dot, index, forcedDistance = null) {
+        if (!dot) return;
+        const center = Number(this.hoveredMarkerIndex);
+        const distance = forcedDistance !== null
+            ? Number(forcedDistance)
+            : (Number.isInteger(center) && center >= 0 ? Math.abs(index - center) : Infinity);
+        const widths = this.hoverWidths;
+        const opacities = this.hoverOpacities;
+        const inRange = Number.isFinite(distance) && distance >= 0 && distance < widths.length;
+        const state = inRange ? distance : -1;
+        if (dot.__timelineHoverState === state) return;
+        dot.__timelineHoverState = state;
+        try {
+            dot.classList.toggle('hover-near', inRange);
+            dot.classList.toggle('hover-center', distance === 0);
+            if (inRange) {
+                const maxWidth = Math.max(1, widths[0] || 1);
+                dot.style.setProperty('--timeline-hover-scale', String(Math.max(0.01, widths[distance] / maxWidth)));
+                dot.style.setProperty('--timeline-hover-opacity', String(opacities[distance]));
+            } else {
+                dot.style.removeProperty('--timeline-hover-scale');
+                dot.style.removeProperty('--timeline-hover-opacity');
+            }
+        } catch {}
+    }
+
+    applyHoverProximityForDot(dot) {
+        const index = this.getMarkerIndexForDot(dot);
+        this.applyHoverProximityForIndex(index);
+    }
+
+    applyHoverProximityForIndex(index) {
+        if (!Number.isInteger(index) || index < 0 || index >= this.markers.length) return;
+        try { this.ui.timelineBar?.classList.add('timeline-hovering'); } catch {}
+        const nextIndices = this.getHoverPaintIndices(index);
+        const nextSet = new Set(nextIndices);
+        for (const paintedIndex of this.hoverPaintedIndices) {
+            if (nextSet.has(paintedIndex)) continue;
+            this.applyHoverStateToDot(this.markers[paintedIndex]?.dotElement, paintedIndex, Infinity);
+        }
+        this.hoveredMarkerIndex = index;
+        for (const paintedIndex of nextIndices) {
+            this.applyHoverStateToDot(
+                this.markers[paintedIndex]?.dotElement,
+                paintedIndex,
+                Math.abs(paintedIndex - index)
+            );
+        }
+        this.hoverPaintedIndices = nextSet;
+    }
+
+    clearHoverProximity() {
+        if (this.hoveredMarkerIndex < 0 && this.hoverPaintedIndices.size === 0) return;
+        this.hoveredMarkerIndex = -1;
+        try { this.ui.timelineBar?.classList.remove('timeline-hovering'); } catch {}
+        for (const paintedIndex of this.hoverPaintedIndices) {
+            this.applyHoverStateToDot(this.markers[paintedIndex]?.dotElement, paintedIndex, Infinity);
+        }
+        this.hoverPaintedIndices.clear();
     }
 
     placeTooltipAt(dot, placement, width, height) {
@@ -1338,61 +1632,61 @@ class TimelineManager {
     refreshTooltipForDot(dot) {
         if (!this.ui?.tooltip || !dot) return;
         const tip = this.ui.tooltip;
-        // Only update when tooltip is currently visible
-        const isVisible = tip.classList.contains('visible');
-        if (!isVisible) return;
-
-        let fullText = (dot.getAttribute('aria-label') || '').trim();
-        try {
-            const id = dot.dataset.targetTurnId;
-            if (id && this.starred.has(id)) fullText = `★ ${fullText}`;
-        } catch {}
+        if (!tip.classList.contains('visible')) return;
+        const marker = this.getMarkerForDot(dot);
+        if (!marker) return;
+        this.renderTooltipContent(tip, marker);
         const p = this.computePlacementInfo(dot);
-        const layout = this.truncateToThreeLines(fullText, p.width, true);
-        tip.textContent = layout.text;
-        this.placeTooltipAt(dot, p.placement, p.width, layout.height);
+        const height = this.measureTooltipHeight(tip, p.width);
+        this.placeTooltipAt(dot, p.placement, p.width, height);
+        this.tooltipMarkerId = marker.id;
     }
 
-    // --- Long-canvas geometry and virtualization (Linked mode) ---
+    // --- Compact centered geometry and virtualization (Codex-style linked mode) ---
     updateTimelineGeometry() {
         if (!this.ui.timelineBar || !this.ui.trackContent) return;
-        const H = this.ui.timelineBar.clientHeight || 0;
         const pad = this.getTrackPadding();
         const minGap = this.getMinGap();
         const N = this.markers.length;
-        const markerRatios = this.markers.map(marker => marker.baseN ?? marker.n ?? 0);
-        const desired = InitialJumpUtils.calculateTimelineContentHeight({
-            viewportHeight: H,
-            padding: pad,
-            minGap,
-            markerRatios
-        });
-        this.contentHeight = Math.ceil(desired);
+        const viewportH = Math.max(0, Math.floor(window.visualViewport?.height || window.innerHeight || 0));
+        const topReserve = 60;
+        const bottomReserve = 100;
+        const availableH = Math.max(80, viewportH - topReserve - bottomReserve);
+        const groupSpan = Math.max(0, N - 1) * minGap;
+        const desired = N > 0 ? Math.ceil(groupSpan + 2 * pad) : 0;
+        const minShell = N > 0 ? Math.max(28, 2 * pad + 4) : 0;
+        const shellH = Math.max(minShell, Math.min(Math.max(desired, minShell), availableH));
+        const shellTop = Math.round(topReserve + Math.max(0, (availableH - shellH) / 2));
+
+        try {
+            this.ui.timelineBar.style.top = `${shellTop}px`;
+            this.ui.timelineBar.style.height = `${Math.round(shellH)}px`;
+            this.timelineHitTop = shellTop;
+        } catch {}
+
+        const H = this.ui.timelineBar.clientHeight || shellH || 1;
+        this.contentHeight = Math.ceil(Math.max(desired, H));
         this.scale = (H > 0) ? (this.contentHeight / H) : 1;
         try { this.ui.trackContent.style.height = `${this.contentHeight}px`; } catch {}
 
-        // Precompute desired Y from normalized baseN and enforce min-gap
-        const usableC = Math.max(1, this.contentHeight - 2 * pad);
-        const desiredY = this.markers.map(m => pad + Math.max(0, Math.min(1, (m.baseN ?? m.n ?? 0))) * usableC);
-        const adjusted = this.applyMinGap(desiredY, pad, pad + usableC, minGap);
-        this.yPositions = adjusted;
-        // Update normalized n for CSS positioning
+        const centerY = this.contentHeight / 2;
+        const startY = N <= 1 ? centerY : Math.max(pad, (this.contentHeight - groupSpan) / 2);
+        this.yPositions = this.markers.map((_, index) => {
+            if (N <= 1) return centerY;
+            return Math.round(startY + index * minGap);
+        });
+
         for (let i = 0; i < N; i++) {
-            const top = adjusted[i];
-            const n = (top - pad) / usableC;
-            this.markers[i].n = Math.max(0, Math.min(1, n));
-            if (this.markers[i].dotElement && !this.usePixelTop) {
-                try { this.markers[i].dotElement.style.setProperty('--n', String(this.markers[i].n)); } catch {}
+            const top = this.yPositions[i] ?? centerY;
+            this.markers[i].n = this.contentHeight > 0 ? Math.max(0, Math.min(1, top / this.contentHeight)) : 0.5;
+            if (this.markers[i].dotElement) {
+                try { this.markers[i].dotElement.style.top = `${Math.round(top)}px`; } catch {}
             }
         }
-        if (this._cssVarTopSupported === null) {
-            this._cssVarTopSupported = this.detectCssVarTopSupport(pad, usableC);
-            this.usePixelTop = !this._cssVarTopSupported;
-        }
+        this.usePixelTop = true;
         this.updateSlider();
-        // First-time nudge: if content is scrollable, briefly reveal slider
-        const barH = this.ui.timelineBar?.clientHeight || 0;
-        if (this.contentHeight > barH + 1) {
+
+        if (this.contentHeight > H + 1) {
             this.sliderAlwaysVisible = true;
             this.showSlider();
         } else {
@@ -1482,7 +1776,8 @@ class TimelineManager {
                 const dot = document.createElement('button');
                 dot.className = 'timeline-dot';
                 dot.dataset.targetTurnId = marker.id;
-                dot.setAttribute('aria-label', marker.summary);
+                dot.dataset.markerIndex = String(i);
+                dot.setAttribute('aria-label', this.getMarkerTooltipLabel(marker));
                 dot.setAttribute('tabindex', '0');
                 dot.setAttribute('type', 'button');
                 try { dot.setAttribute('aria-describedby', 'chatgpt-timeline-tooltip'); } catch {}
@@ -1497,6 +1792,7 @@ class TimelineManager {
                     dot.classList.toggle('starred', !!marker.starred);
                     dot.setAttribute('aria-pressed', marker.starred ? 'true' : 'false');
                 } catch {}
+                this.applyHoverStateToDot(dot, i);
                 marker.dotElement = dot;
                 frag.appendChild(dot);
             } else {
@@ -1505,9 +1801,12 @@ class TimelineManager {
                     marker.dotElement.style.top = `${Math.round(this.yPositions[i])}px`;
                 }
                 try {
+                    marker.dotElement.dataset.markerIndex = String(i);
+                    marker.dotElement.setAttribute('aria-label', this.getMarkerTooltipLabel(marker));
                     marker.dotElement.classList.toggle('starred', !!marker.starred);
                     marker.dotElement.setAttribute('aria-pressed', marker.starred ? 'true' : 'false');
                 } catch {}
+                this.applyHoverStateToDot(marker.dotElement, i);
             }
         }
         if (localVersion !== this.markersVersion) return; // stale pass, abort
@@ -1626,14 +1925,14 @@ class TimelineManager {
         const boxGap = this.getCSSVarNumber(tip, '--timeline-tooltip-gap-box', 8);
         const gap = baseGap + Math.max(0, arrowOut) + Math.max(0, boxGap);
         const viewportPad = 8;
-        const maxW = this.getCSSVarNumber(tip, '--timeline-tooltip-max', 288);
+        const maxW = this.getCSSVarNumber(tip, '--timeline-tooltip-max', 448);
         const minW = 160;
         const leftAvail = Math.max(0, dotRect.left - gap - viewportPad);
         const rightAvail = Math.max(0, vw - dotRect.right - gap - viewportPad);
         let placement = (rightAvail > leftAvail) ? 'right' : 'left';
         let avail = placement === 'right' ? rightAvail : leftAvail;
-        // choose width tier for determinism
-        const tiers = [280, 240, 200, 160];
+        // choose width tier for determinism; primary width is about 30% wider than the old 280px card
+        const tiers = [364, 328, 288, 240, 200, 160];
         const hardMax = Math.max(minW, Math.min(maxW, Math.floor(avail)));
         let width = tiers.find(t => t <= hardMax) || Math.max(minW, Math.min(hardMax, 160));
         // if no tier fits (very tight), try switching side
@@ -1659,12 +1958,12 @@ class TimelineManager {
             const lineH = this.getCSSVarNumber(tip, '--timeline-tooltip-lh', 18);
             const padY = this.getCSSVarNumber(tip, '--timeline-tooltip-pad-y', 10);
             const borderW = this.getCSSVarNumber(tip, '--timeline-tooltip-border-w', 1);
-            const maxH = Math.round(3 * lineH + 2 * padY + 2 * borderW);
+            const maxH = Math.round(5 * lineH + 2 * padY + 2 * borderW + 4);
             const ell = '…';
             const el = this.measureEl;
             el.style.width = `${Math.max(0, Math.floor(targetWidth))}px`;
 
-            // fast path: full text fits within 3 lines
+            // fast path: full text fits within 5 lines
             el.textContent = String(text || '').replace(/\s+/g, ' ').trim();
             let h = el.offsetHeight;
             if (h <= maxH) {
@@ -1775,6 +2074,7 @@ class TimelineManager {
         }
         if (this.ui.timelineBar) {
             try { this.ui.timelineBar.removeEventListener('mouseover', this.onTimelineBarOver); } catch {}
+            try { this.ui.timelineBar.removeEventListener('pointermove', this.onTimelinePointerMove); } catch {}
             try { this.ui.timelineBar.removeEventListener('mouseout', this.onTimelineBarOut); } catch {}
             try { this.ui.timelineBar.removeEventListener('focusin', this.onTimelineBarFocusIn); } catch {}
             try { this.ui.timelineBar.removeEventListener('focusout', this.onTimelineBarFocusOut); } catch {}
@@ -1799,6 +2099,11 @@ class TimelineManager {
             try { cancelAnimationFrame(this.scrollRafId); } catch {}
             this.scrollRafId = null;
         }
+        if (this.showRafId !== null) {
+            try { cancelAnimationFrame(this.showRafId); } catch {}
+            this.showRafId = null;
+        }
+        this.cancelScheduledTooltip();
         this.cancelSmoothScroll();
         this.cancelScrollCorrection();
         this.cancelInitialJumpReadinessWatch();
@@ -1845,6 +2150,11 @@ class TimelineManager {
         
         if (this.sliderFadeTimer) { try { clearTimeout(this.sliderFadeTimer); } catch {} this.sliderFadeTimer = null; }
         this.pendingActiveId = null;
+        this.timelineHitTop = NaN;
+        this.pendingTooltipDot = null;
+        this.hoveredMarkerIndex = -1;
+        this.hoverPaintedIndices.clear();
+        this.tooltipMarkerId = null;
     }
 
     // --- Star/Highlight helpers ---
@@ -1889,6 +2199,7 @@ class TimelineManager {
                 try {
                     m.dotElement.classList.toggle('starred', m.starred);
                     m.dotElement.setAttribute('aria-pressed', m.starred ? 'true' : 'false');
+                    m.dotElement.setAttribute('aria-label', this.getMarkerTooltipLabel(m));
                 } catch {}
                 // If tooltip is visible and anchored to this dot, update immediately
                 try { this.refreshTooltipForDot(m.dotElement); } catch {}

@@ -12,7 +12,9 @@ const {
   resolveScrollFocusOffset,
   resolveScrollTarget,
   shouldRunTimelineJump,
-  selectActiveIndex
+  selectActiveIndex,
+  selectNearestIndexByY,
+  selectHoverPaintIndices
 } = require('../extension/chatgpt-initial-jump-utils.js');
 
 function run(name, fn) {
@@ -247,6 +249,58 @@ run('calculateTimelineContentHeight keeps the viewport height when proportional 
     minGap: 24,
     markerRatios: [0, 0.25, 0.5, 0.75, 1]
   }), 651);
+});
+
+run('selectNearestIndexByY chooses the closest timeline position', () => {
+  assert.equal(selectNearestIndexByY({
+    positions: [20, 40, 60, 80],
+    value: 53,
+    threshold: 12
+  }), 2);
+});
+
+run('selectNearestIndexByY rejects positions outside the pointer threshold', () => {
+  assert.equal(selectNearestIndexByY({
+    positions: [20, 40, 60, 80],
+    value: 105,
+    threshold: 12
+  }), -1);
+});
+
+run('selectNearestIndexByY handles edges without scanning every item', () => {
+  assert.equal(selectNearestIndexByY({
+    positions: [20, 40, 60, 80],
+    value: 17,
+    threshold: 5
+  }), 0);
+  assert.equal(selectNearestIndexByY({
+    positions: [20, 40, 60, 80],
+    value: 84,
+    threshold: 5
+  }), 3);
+});
+
+run('selectHoverPaintIndices returns the bounded staircase paint range', () => {
+  assert.deepEqual(selectHoverPaintIndices({
+    center: 0,
+    count: 6,
+    radius: 4
+  }), [0, 1, 2, 3, 4]);
+
+  assert.deepEqual(selectHoverPaintIndices({
+    center: 5,
+    count: 6,
+    radius: 4
+  }), [1, 2, 3, 4, 5]);
+});
+
+run('selectHoverPaintIndices supports clearing old rapid-hover ranges deterministically', () => {
+  const previous = new Set(selectHoverPaintIndices({ center: 3, count: 12, radius: 4 }));
+  const next = new Set(selectHoverPaintIndices({ center: 9, count: 12, radius: 4 }));
+  const stale = [...previous].filter(index => !next.has(index));
+  const fresh = [...next].filter(index => !previous.has(index));
+  assert.deepEqual(stale, [0, 1, 2, 3, 4]);
+  assert.deepEqual(fresh, [8, 9, 10, 11]);
 });
 
 run('pickBestScrollableCandidate prefers the nearest real non-document scroll root', () => {

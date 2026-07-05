@@ -241,6 +241,51 @@
     return Math.max(0, Math.min(positions.length - 1, active));
   }
 
+  function selectNearestIndexByY(input = {}) {
+    const positions = Array.isArray(input.positions) ? input.positions : [];
+    const value = Number(input.value);
+    const rawThreshold = Number(input.threshold);
+    const threshold = Number.isFinite(rawThreshold) ? Math.max(0, rawThreshold) : Infinity;
+    if (!positions.length || !Number.isFinite(value)) return -1;
+
+    let lo = 0;
+    let hi = positions.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const position = Number(positions[mid]);
+      if (!Number.isFinite(position) || position < value) lo = mid + 1;
+      else hi = mid;
+    }
+
+    let best = -1;
+    let bestDistance = Infinity;
+    for (const index of [lo - 1, lo]) {
+      if (index < 0 || index >= positions.length) continue;
+      const position = Number(positions[index]);
+      if (!Number.isFinite(position)) continue;
+      const distance = Math.abs(position - value);
+      if (distance < bestDistance) {
+        best = index;
+        bestDistance = distance;
+      }
+    }
+
+    return bestDistance <= threshold ? best : -1;
+  }
+
+  function selectHoverPaintIndices(input = {}) {
+    const count = Math.max(0, Math.floor(Number(input.count) || 0));
+    const center = Math.floor(Number(input.center));
+    const radius = Math.max(0, Math.floor(Number(input.radius) || 0));
+    if (!count || !Number.isInteger(center) || center < 0 || center >= count) return [];
+
+    const start = Math.max(0, center - radius);
+    const end = Math.min(count - 1, center + radius);
+    const indices = [];
+    for (let i = start; i <= end; i++) indices.push(i);
+    return indices;
+  }
+
   return {
     evaluateInitialJumpReadiness,
     evaluateScrollCorrection,
@@ -253,6 +298,8 @@
     resolveScrollAnchoring,
     resolveScrollFocusOffset,
     resolveScrollTarget,
-    selectActiveIndex
+    selectActiveIndex,
+    selectNearestIndexByY,
+    selectHoverPaintIndices
   };
 });

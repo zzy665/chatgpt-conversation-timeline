@@ -1,12 +1,12 @@
 // Runs in page's MAIN world (has access to React fiber internals).
 // Content scripts cannot read expando properties like __reactFiber$xxx due to
 // world isolation. This bridge listens for a custom DOM event from the content
-// script, reads fiber data for virtualized user-turn elements, and passes the
+// script, reads fiber data for virtualized turn elements, and passes the
 // text back via CustomEvent.detail — zero DOM modifications, zero traces.
 document.addEventListener('timeline-extract-fiber', () => {
   try {
     const result = {};
-    document.querySelectorAll('[data-turn="user"][data-turn-id]').forEach(el => {
+    document.querySelectorAll('[data-turn-id]').forEach(el => {
       if (el.childElementCount > 0) return; // has DOM content, skip
       try {
         const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));

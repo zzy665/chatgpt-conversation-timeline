@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Conversation Timeline",
-  "version": "3.3.0",
-  "description": "Adds a navigation timeline to your ChatGPT, DeepSeek, and Gemini conversations for easy navigation.",
+  "version": "3.3.1",
+  "description": "Adds a navigation timeline to ChatGPT, mana-x, DeepSeek, and Gemini conversations.",
   "action": {
     "default_popup": "popup.html",
     "default_title": "会话时间轴"
@@ -20,7 +20,8 @@
     {
       "matches": [
         "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
+        "https://chat.openai.com/*",
+        "https://mana-x.aizex.net/*"
       ],
       "js": ["chatgpt-initial-jump-utils.js", "content-chatgpt.js"],
       "css": ["styles-chatgpt.css"]
@@ -28,7 +29,8 @@
     {
       "matches": [
         "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
+        "https://chat.openai.com/*",
+        "https://mana-x.aizex.net/*"
       ],
       "js": ["fiber-bridge-chatgpt.js"],
       "world": "MAIN"
