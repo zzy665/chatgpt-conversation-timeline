@@ -55,6 +55,7 @@ class TimelineManager {
         this.ui.trackContent = null;
         this.scale = 1;
         this.contentHeight = 0;
+        this.timelineTrackOffset = 0;
         this.yPositions = [];
         this.timelineHitTop = NaN;
         this.hoverDistanceThreshold = 42;
@@ -67,17 +68,11 @@ class TimelineManager {
         this.contentSpanPx = 1;
         this.usePixelTop = true; // Codex-style compact layout uses explicit pixel positions.
         this._cssVarTopSupported = true;
-        // Left-side slider (only controls timeline scroll)
-        this.ui.slider = null;
-        this.ui.sliderHandle = null;
-        this.sliderDragging = false;
-        this.sliderFadeTimer = null;
-        this.sliderFadeDelay = 1000;
-        this.sliderAlwaysVisible = false; // show slider persistently when scrollable
-        this.onSliderDown = null;
-        this.onSliderMove = null;
-        this.onSliderUp = null;
         this.markersVersion = 0;
+        this.markerPositionsDirty = true;
+        this.markerPositionsLastRefreshAt = 0;
+        this.summaryRefreshTimer = null;
+        this.summaryRefreshDelay = 900;
         // Debug perf
         this.debugPerf = false;
         try { this.debugPerf = (localStorage.getItem('chatgptTimelineDebugPerf') === '1'); } catch {}
@@ -200,19 +195,7 @@ class TimelineManager {
         }
         this.ui.track = track;
         this.ui.trackContent = trackContent;
-        // Ensure external left-side slider exists (outside the bar)
-        let slider = document.querySelector('.timeline-left-slider');
-        if (!slider) {
-            slider = document.createElement('div');
-            slider.className = 'timeline-left-slider';
-            const handle = document.createElement('div');
-            handle.className = 'timeline-left-handle';
-            slider.appendChild(handle);
-            document.body.appendChild(slider);
-        }
-        this.ui.slider = slider;
-        this.ui.sliderHandle = slider.querySelector('.timeline-left-handle');
-        // Visibility will be controlled by updateSlider() based on scrollable state
+        this.enforceTimelineNoScrollbarStyles();
         if (!this.ui.tooltip) {
             const tip = document.createElement('div');
             tip.className = 'timeline-tooltip';
@@ -297,6 +280,8 @@ class TimelineManager {
         this.firstUserTurnOffset = firstTurnOffset;
         this.contentSpanPx = contentSpan;
         this.markerScrollPositions = measuredPositions;
+        this.markerPositionsDirty = false;
+        this.markerPositionsLastRefreshAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
         // Build markers with normalized position along conversation
         this.markerMap.clear();
@@ -342,9 +327,82 @@ class TimelineManager {
         this.scheduleScrollSync();
         this.perfEnd('recalc');
     }
+
+    markMarkerPositionsDirty() {
+        this.markerPositionsDirty = true;
+    }
+
+    scheduleSummaryRefresh() {
+        if (this.summaryRefreshTimer) {
+            try { clearTimeout(this.summaryRefreshTimer); } catch {}
+        }
+        this.summaryRefreshTimer = setTimeout(() => {
+            this.summaryRefreshTimer = null;
+            this.refreshMarkerSummaries();
+            this.markMarkerPositionsDirty();
+            this.scheduleScrollSync();
+        }, this.summaryRefreshDelay);
+    }
+
+    enforceTimelineNoScrollbarStyles() {
+        try {
+            const styleId = 'chatgpt-timeline-no-scrollbar-style';
+            if (!document.getElementById(styleId)) {
+                const style = document.createElement('style');
+                style.id = styleId;
+                style.textContent = `
+.chatgpt-timeline-bar .timeline-track,
+.chatgpt-timeline-bar .timeline-track-content {
+  overflow: hidden !important;
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+  scrollbar-gutter: auto !important;
+}
+.chatgpt-timeline-bar .timeline-track::-webkit-scrollbar,
+.chatgpt-timeline-bar .timeline-track::-webkit-scrollbar-button,
+.chatgpt-timeline-bar .timeline-track::-webkit-scrollbar-thumb,
+.chatgpt-timeline-bar .timeline-track::-webkit-scrollbar-track,
+.chatgpt-timeline-bar .timeline-track-content::-webkit-scrollbar,
+.chatgpt-timeline-bar .timeline-track-content::-webkit-scrollbar-button,
+.chatgpt-timeline-bar .timeline-track-content::-webkit-scrollbar-thumb,
+.chatgpt-timeline-bar .timeline-track-content::-webkit-scrollbar-track {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  background: transparent !important;
+}
+`;
+                (document.head || document.documentElement || document.body)?.appendChild(style);
+            }
+        } catch {}
+
+        for (const el of [this.ui.track, this.ui.trackContent]) {
+            if (!el) continue;
+            try {
+                el.style.setProperty('overflow', 'hidden', 'important');
+                el.style.setProperty('overflow-x', 'hidden', 'important');
+                el.style.setProperty('overflow-y', 'hidden', 'important');
+                el.style.setProperty('scrollbar-width', 'none', 'important');
+                el.style.setProperty('-ms-overflow-style', 'none', 'important');
+                el.style.setProperty('scrollbar-gutter', 'auto', 'important');
+                el.scrollTop = 0;
+                el.scrollLeft = 0;
+            } catch {}
+        }
+    }
     
     setupObservers() {
-        this.mutationObserver = new MutationObserver(() => {
+        this.mutationObserver = new MutationObserver((mutations) => {
+            const impact = InitialJumpUtils.classifyTimelineMutationRecords(mutations);
+            if (!impact.needsRebuild) {
+                if (impact.needsSummaryRefresh) this.scheduleSummaryRefresh();
+                this.scheduleScrollSync();
+                return;
+            }
+
+            this.markMarkerPositionsDirty();
             try { this.ensureContainersUpToDate(); } catch {}
             this.debouncedRecalculateAndRender();
             this.updateIntersectionObserverTargets();
@@ -385,6 +443,7 @@ class TimelineManager {
         try {
             if (!this.themeObserver) {
                 this.themeObserver = new MutationObserver(() => {
+                    this.markMarkerPositionsDirty();
                     this.updateTimelineGeometry();
                     this.syncTimelineTrackToMain();
                     this.updateVirtualRangeAndRender();
@@ -427,6 +486,7 @@ class TimelineManager {
         this.conversationContainer = newConv;
 
         this.scrollContainer = this.getScrollableAncestor(newConv);
+        this.markMarkerPositionsDirty();
         // Reattach scroll listener
         this.onScroll = () => {
             this.scheduleScrollSync();
@@ -576,19 +636,9 @@ class TimelineManager {
         this.ui.timelineBar.addEventListener('focusin', this.onTimelineBarFocusIn);
         this.ui.timelineBar.addEventListener('focusout', this.onTimelineBarFocusOut);
 
-        // Slider visibility on hover (time axis or slider itself) with stable refs
-        // Define and persist handlers so we can remove them in destroy()
-        this.onBarEnter = () => this.showSlider();
-        this.onBarLeave = () => { this.hideSliderDeferred(); this.hideTooltip(); this.clearHoverProximity(); };
-        this.onSliderEnter = () => this.showSlider();
-        this.onSliderLeave = () => this.hideSliderDeferred();
+        this.onBarLeave = () => { this.hideTooltip(); this.clearHoverProximity(); };
         try {
-            this.ui.timelineBar.addEventListener('pointerenter', this.onBarEnter);
             this.ui.timelineBar.addEventListener('pointerleave', this.onBarLeave);
-            if (this.ui.slider) {
-                this.ui.slider.addEventListener('pointerenter', this.onSliderEnter);
-                this.ui.slider.addEventListener('pointerleave', this.onSliderLeave);
-            }
         } catch {}
 
         // Reposition tooltip on resize
@@ -598,6 +648,7 @@ class TimelineManager {
                 if (marker?.dotElement) this.refreshTooltipForDot(marker.dotElement);
             }
             // Update long-canvas geometry and virtualization
+            this.markMarkerPositionsDirty();
             this.updateTimelineGeometry();
             this.syncTimelineTrackToMain();
             this.updateVirtualRangeAndRender();
@@ -606,6 +657,7 @@ class TimelineManager {
         // VisualViewport resize can fire on zoom on some platforms; schedule correction
         if (window.visualViewport) {
             this.onVisualViewportResize = () => {
+                this.markMarkerPositionsDirty();
                 this.updateTimelineGeometry();
                 this.syncTimelineTrackToMain();
                 this.updateVirtualRangeAndRender();
@@ -621,25 +673,8 @@ class TimelineManager {
             this.scrollContainer.scrollTop += delta;
             // Keep markers in sync on next frame
             this.scheduleScrollSync();
-            this.showSlider();
         };
         this.ui.timelineBar.addEventListener('wheel', this.onTimelineWheel, { passive: false });
-
-        // Slider drag handlers
-        this.onSliderDown = (ev) => {
-            if (!this.ui.sliderHandle) return;
-            try { this.ui.sliderHandle.setPointerCapture(ev.pointerId); } catch {}
-            this.sliderDragging = true;
-            this.showSlider();
-            this.sliderStartClientY = ev.clientY;
-            const rect = this.ui.sliderHandle.getBoundingClientRect();
-            this.sliderStartTop = rect.top;
-            this.onSliderMove = (e) => this.handleSliderDrag(e);
-            this.onSliderUp = (e) => this.endSliderDrag(e);
-            window.addEventListener('pointermove', this.onSliderMove);
-            window.addEventListener('pointerup', this.onSliderUp, { once: true });
-        };
-        try { this.ui.sliderHandle?.addEventListener('pointerdown', this.onSliderDown); } catch {}
 
         // Cross-tab star sync via localStorage 'storage' event
         this.onStorage = (e) => {
@@ -907,9 +942,14 @@ class TimelineManager {
         try { return Number(targetElement?.offsetTop) || 0; } catch { return 0; }
     }
 
-    refreshMarkerScrollPositions() {
+    refreshMarkerScrollPositions(options = {}) {
         if (!this.markers.length) {
             this.markerScrollPositions = [];
+            this.markerPositionsDirty = false;
+            return this.markerScrollPositions;
+        }
+        const force = !!options.force;
+        if (!force && !this.markerPositionsDirty && this.markerScrollPositions.length === this.markers.length) {
             return this.markerScrollPositions;
         }
         const positions = this.markers.map(marker => this.getElementScrollAnchorTop(marker.element));
@@ -918,6 +958,8 @@ class TimelineManager {
         const last = positions[positions.length - 1] || first;
         this.firstUserTurnOffset = first;
         this.contentSpanPx = Math.max(1, last - first);
+        this.markerPositionsDirty = false;
+        this.markerPositionsLastRefreshAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
         return positions;
     }
 
@@ -1265,6 +1307,53 @@ class TimelineManager {
         return { question, answer };
     }
 
+    refreshMarkerSummaries() {
+        if (!this.conversationContainer || !this.markers.length) return;
+        try { this.extractFiberTexts(); } catch {}
+
+        const allTurnElements = Array.from(this.conversationContainer.querySelectorAll('[data-turn-id]'));
+        let tooltipDot = null;
+
+        for (let i = 0; i < this.markers.length; i++) {
+            const marker = this.markers[i];
+            if (!marker?.id) continue;
+
+            let userEl = marker.element;
+            if (!userEl?.isConnected) {
+                userEl = allTurnElements.find(el => el?.dataset?.turnId === marker.id) || null;
+                if (userEl) marker.element = userEl;
+            }
+            if (!userEl) continue;
+
+            const pair = this.resolveTurnPairSummary(userEl, allTurnElements);
+            const tooltipLabel = this.composeTooltipLabel(pair.question, pair.answer);
+            if (
+                marker.summary === pair.question &&
+                marker.answerSummary === pair.answer &&
+                marker.tooltipLabel === tooltipLabel
+            ) {
+                continue;
+            }
+
+            marker.summary = pair.question;
+            marker.answerSummary = pair.answer;
+            marker.tooltipLabel = tooltipLabel;
+
+            if (marker.dotElement) {
+                try { marker.dotElement.setAttribute('aria-label', this.getMarkerTooltipLabel(marker)); } catch {}
+                if (marker.id === this.tooltipMarkerId) tooltipDot = marker.dotElement;
+            }
+        }
+
+        if (!tooltipDot && this.tooltipMarkerId) {
+            const marker = this.markerMap.get(this.tooltipMarkerId);
+            tooltipDot = marker?.dotElement || null;
+        }
+        if (tooltipDot) {
+            try { this.refreshTooltipForDot(tooltipDot); } catch {}
+        }
+    }
+
     composeTooltipLabel(question, answer) {
         const q = this.normalizeText(question || '');
         const a = this.normalizeText(answer || '');
@@ -1468,12 +1557,36 @@ class TimelineManager {
         return NaN;
     }
 
+    getTimelineTrackOffset() {
+        const offset = Number(this.timelineTrackOffset);
+        return Number.isFinite(offset) ? Math.max(0, offset) : 0;
+    }
+
+    setTimelineTrackOffset(value) {
+        const trackHeight = Math.max(0, Number(this.ui.track?.clientHeight) || 0);
+        const maxOffset = Math.max(0, (Number(this.contentHeight) || 0) - trackHeight);
+        const next = Math.round(Math.max(0, Math.min(maxOffset, Number(value) || 0)));
+        const changed = Math.abs(this.getTimelineTrackOffset() - next) > 0;
+        this.timelineTrackOffset = next;
+        try {
+            if (this.ui.track) this.ui.track.scrollTop = 0;
+            if (this.ui.trackContent) this.ui.trackContent.scrollTop = 0;
+        } catch {}
+        return changed;
+    }
+
+    getMarkerViewportTop(index) {
+        const top = Number(this.yPositions[index]);
+        if (!Number.isFinite(top)) return 0;
+        return Math.round(top - this.getTimelineTrackOffset());
+    }
+
     findNearestMarkerIndexByClientY(clientY) {
         const y = Number(clientY);
         if (!Number.isFinite(y) || !this.yPositions.length || !this.ui.track) return -1;
         const trackTop = this.getTimelineTrackTop();
         if (!Number.isFinite(trackTop)) return -1;
-        const contentY = y - trackTop + (this.ui.track.scrollTop || 0);
+        const contentY = y - trackTop + this.getTimelineTrackOffset();
         return InitialJumpUtils.selectNearestIndexByY({
             positions: this.yPositions,
             value: contentY,
@@ -1645,6 +1758,7 @@ class TimelineManager {
     // --- Compact centered geometry and virtualization (Codex-style linked mode) ---
     updateTimelineGeometry() {
         if (!this.ui.timelineBar || !this.ui.trackContent) return;
+        this.enforceTimelineNoScrollbarStyles();
         const pad = this.getTrackPadding();
         const minGap = this.getMinGap();
         const N = this.markers.length;
@@ -1666,8 +1780,9 @@ class TimelineManager {
 
         const H = this.ui.timelineBar.clientHeight || shellH || 1;
         this.contentHeight = Math.ceil(Math.max(desired, H));
+        this.setTimelineTrackOffset(this.getTimelineTrackOffset());
         this.scale = (H > 0) ? (this.contentHeight / H) : 1;
-        try { this.ui.trackContent.style.height = `${this.contentHeight}px`; } catch {}
+        try { this.ui.trackContent.style.height = `${Math.round(H)}px`; } catch {}
 
         const centerY = this.contentHeight / 2;
         const startY = N <= 1 ? centerY : Math.max(pad, (this.contentHeight - groupSpan) / 2);
@@ -1680,18 +1795,10 @@ class TimelineManager {
             const top = this.yPositions[i] ?? centerY;
             this.markers[i].n = this.contentHeight > 0 ? Math.max(0, Math.min(1, top / this.contentHeight)) : 0.5;
             if (this.markers[i].dotElement) {
-                try { this.markers[i].dotElement.style.top = `${Math.round(top)}px`; } catch {}
+                try { this.markers[i].dotElement.style.top = `${this.getMarkerViewportTop(i)}px`; } catch {}
             }
         }
         this.usePixelTop = true;
-        this.updateSlider();
-
-        if (this.contentHeight > H + 1) {
-            this.sliderAlwaysVisible = true;
-            this.showSlider();
-        } else {
-            this.sliderAlwaysVisible = false;
-        }
     }
 
     detectCssVarTopSupport(pad, usableC) {
@@ -1717,7 +1824,6 @@ class TimelineManager {
     }
 
     syncTimelineTrackToMain() {
-        if (this.sliderDragging) return; // do not override when user drags slider
         if (!this.ui.track || !this.scrollContainer || !this.contentHeight) return;
         const scrollTop = this.scrollContainer.scrollTop;
         const ref = this.getActiveReferenceY(scrollTop);
@@ -1730,15 +1836,16 @@ class TimelineManager {
         });
         const maxScroll = Math.max(0, this.contentHeight - (this.ui.track.clientHeight || 0));
         const target = Math.round(r * maxScroll);
-        if (Math.abs((this.ui.track.scrollTop || 0) - target) > 1) {
-            this.ui.track.scrollTop = target;
+        if (Math.abs(this.getTimelineTrackOffset() - target) > 1) {
+            this.setTimelineTrackOffset(target);
         }
     }
 
     updateVirtualRangeAndRender() {
         const localVersion = this.markersVersion;
         if (!this.ui.track || !this.ui.trackContent || this.markers.length === 0) return;
-        const st = this.ui.track.scrollTop || 0;
+        this.enforceTimelineNoScrollbarStyles();
+        const st = this.getTimelineTrackOffset();
         const vh = this.ui.track.clientHeight || 0;
         const buffer = Math.max(100, vh);
         const minY = st - buffer;
@@ -1783,7 +1890,7 @@ class TimelineManager {
                 try { dot.setAttribute('aria-describedby', 'chatgpt-timeline-tooltip'); } catch {}
                 try { dot.style.setProperty('--n', String(marker.n || 0)); } catch {}
                 if (this.usePixelTop) {
-                    dot.style.top = `${Math.round(this.yPositions[i])}px`;
+                    dot.style.top = `${this.getMarkerViewportTop(i)}px`;
                 }
                 // Apply active state immediately if this is the active marker
                 try { dot.classList.toggle('active', marker.id === this.activeTurnId); } catch {}
@@ -1798,7 +1905,7 @@ class TimelineManager {
             } else {
                 try { marker.dotElement.style.setProperty('--n', String(marker.n || 0)); } catch {}
                 if (this.usePixelTop) {
-                    marker.dotElement.style.top = `${Math.round(this.yPositions[i])}px`;
+                    marker.dotElement.style.top = `${this.getMarkerViewportTop(i)}px`;
                 }
                 try {
                     marker.dotElement.dataset.markerIndex = String(i);
@@ -1812,8 +1919,6 @@ class TimelineManager {
         if (localVersion !== this.markersVersion) return; // stale pass, abort
         if (frag.childNodes.length) this.ui.trackContent.appendChild(frag);
         this.visibleRange = { start, end };
-        // keep slider in sync with timeline scroll
-        this.updateSlider();
     }
 
     lowerBound(arr, x) {
@@ -1832,88 +1937,6 @@ class TimelineManager {
             if (arr[mid] <= x) lo = mid + 1; else hi = mid;
         }
         return lo - 1;
-    }
-
-    // --- Left slider helpers ---
-    updateSlider() {
-        if (!this.ui.slider || !this.ui.sliderHandle) return;
-        if (!this.contentHeight || !this.ui.timelineBar || !this.ui.track) return;
-        const barRect = this.ui.timelineBar.getBoundingClientRect();
-        const barH = barRect.height || 0;
-        const pad = this.getTrackPadding();
-        const innerH = Math.max(0, barH - 2 * pad);
-        if (this.contentHeight <= barH + 1 || innerH <= 0) {
-            this.sliderAlwaysVisible = false;
-            try {
-                this.ui.slider.classList.remove('visible');
-                this.ui.slider.style.opacity = '';
-            } catch {}
-            return;
-        }
-        this.sliderAlwaysVisible = true;
-        // External slider geometry (short rail centered on inner area)
-        const railLen = Math.max(120, Math.min(240, Math.floor(barH * 0.45)));
-        const railTop = Math.round(barRect.top + pad + (innerH - railLen) / 2);
-        const railLeftGap = 8; // px gap from bar's left edge
-        const sliderWidth = 12; // matches CSS
-        const left = Math.round(barRect.left - railLeftGap - sliderWidth);
-        this.ui.slider.style.left = `${left}px`;
-        this.ui.slider.style.top = `${railTop}px`;
-        this.ui.slider.style.height = `${railLen}px`;
-
-        const handleH = 22; // fixed concise handle
-        const maxTop = Math.max(0, railLen - handleH);
-        const range = Math.max(1, this.contentHeight - barH);
-        const st = this.ui.track.scrollTop || 0;
-        const r = Math.max(0, Math.min(1, st / range));
-        const top = Math.round(r * maxTop);
-        this.ui.sliderHandle.style.height = `${handleH}px`;
-        this.ui.sliderHandle.style.top = `${top}px`;
-        try {
-            this.ui.slider.classList.add('visible');
-            this.ui.slider.style.opacity = '';
-        } catch {}
-    }
-
-    showSlider() {
-        if (!this.ui.slider) return;
-        this.ui.slider.classList.add('visible');
-        if (this.sliderFadeTimer) { try { clearTimeout(this.sliderFadeTimer); } catch {} this.sliderFadeTimer = null; }
-        this.updateSlider();
-    }
-
-    hideSliderDeferred() {
-        if (this.sliderDragging || this.sliderAlwaysVisible) return;
-        if (this.sliderFadeTimer) { try { clearTimeout(this.sliderFadeTimer); } catch {} }
-        this.sliderFadeTimer = setTimeout(() => {
-            this.sliderFadeTimer = null;
-            try { this.ui.slider?.classList.remove('visible'); } catch {}
-        }, this.sliderFadeDelay);
-    }
-
-    handleSliderDrag(e) {
-        if (!this.sliderDragging || !this.ui.timelineBar || !this.ui.track) return;
-        const barRect = this.ui.timelineBar.getBoundingClientRect();
-        const barH = barRect.height || 0;
-        const railLen = parseFloat(this.ui.slider.style.height || '0') || Math.max(120, Math.min(240, Math.floor(barH * 0.45)));
-        const handleH = this.ui.sliderHandle.getBoundingClientRect().height || 22;
-        const maxTop = Math.max(0, railLen - handleH);
-        const delta = e.clientY - this.sliderStartClientY;
-        let top = Math.max(0, Math.min(maxTop, (this.sliderStartTop + delta) - (parseFloat(this.ui.slider.style.top) || 0)));
-        const r = (maxTop > 0) ? (top / maxTop) : 0;
-        const range = Math.max(1, this.contentHeight - barH);
-        this.ui.track.scrollTop = Math.round(r * range);
-        this.updateVirtualRangeAndRender();
-        this.showSlider();
-        this.updateSlider();
-    }
-
-    endSliderDrag(e) {
-        this.sliderDragging = false;
-        try { window.removeEventListener('pointermove', this.onSliderMove); } catch {}
-        this.onSliderMove = null;
-        this.onSliderUp = null;
-        this.hideSliderDeferred();
     }
 
     computePlacementInfo(dot) {
@@ -1996,7 +2019,6 @@ class TimelineManager {
             this.syncTimelineTrackToMain();
             this.updateVirtualRangeAndRender();
             this.computeActiveByScroll();
-            this.updateSlider();
         });
     }
 
@@ -2080,14 +2102,9 @@ class TimelineManager {
             try { this.ui.timelineBar.removeEventListener('focusout', this.onTimelineBarFocusOut); } catch {}
             try { this.ui.timelineBar.removeEventListener('wheel', this.onTimelineWheel); } catch {}
             // Remove hover handlers with stable refs
-            try { this.ui.timelineBar?.removeEventListener('pointerenter', this.onBarEnter); } catch {}
             try { this.ui.timelineBar?.removeEventListener('pointerleave', this.onBarLeave); } catch {}
-            try { this.ui.slider?.removeEventListener('pointerenter', this.onSliderEnter); } catch {}
-            try { this.ui.slider?.removeEventListener('pointerleave', this.onSliderLeave); } catch {}
-            this.onBarEnter = this.onBarLeave = this.onSliderEnter = this.onSliderLeave = null;
+            this.onBarLeave = null;
         }
-        try { this.ui.sliderHandle?.removeEventListener('pointerdown', this.onSliderDown); } catch {}
-        try { window.removeEventListener('pointermove', this.onSliderMove); } catch {}
         if (this.onWindowResize) {
             try { window.removeEventListener('resize', this.onWindowResize); } catch {}
         }
@@ -2110,20 +2127,14 @@ class TimelineManager {
         try { this.ui.timelineBar?.remove(); } catch {}
         try { this.ui.tooltip?.remove(); } catch {}
         try { this.measureEl?.remove(); } catch {}
-        // Ensure external left slider is fully removed and not intercepting pointer events
+        // Remove any slider left behind by older extension builds.
         try {
-            if (this.ui.slider) {
-                try { this.ui.slider.style.pointerEvents = 'none'; } catch {}
-                try { this.ui.slider.remove(); } catch {}
-            }
             const straySlider = document.querySelector('.timeline-left-slider');
             if (straySlider) {
                 try { straySlider.style.pointerEvents = 'none'; } catch {}
                 try { straySlider.remove(); } catch {}
             }
         } catch {}
-        this.ui.slider = null;
-        this.ui.sliderHandle = null;
         this.ui = { timelineBar: null, tooltip: null };
         this.markers = [];
         this.summaryCache.clear();
@@ -2147,14 +2158,20 @@ class TimelineManager {
             try { clearTimeout(this.tooltipHideTimer); } catch {}
             this.tooltipHideTimer = null;
         }
+        if (this.summaryRefreshTimer) {
+            try { clearTimeout(this.summaryRefreshTimer); } catch {}
+            this.summaryRefreshTimer = null;
+        }
         
-        if (this.sliderFadeTimer) { try { clearTimeout(this.sliderFadeTimer); } catch {} this.sliderFadeTimer = null; }
         this.pendingActiveId = null;
         this.timelineHitTop = NaN;
+        this.timelineTrackOffset = 0;
         this.pendingTooltipDot = null;
         this.hoveredMarkerIndex = -1;
         this.hoverPaintedIndices.clear();
         this.tooltipMarkerId = null;
+        this.markerPositionsDirty = true;
+        this.markerPositionsLastRefreshAt = 0;
     }
 
     // --- Star/Highlight helpers ---

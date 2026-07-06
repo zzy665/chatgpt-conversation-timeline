@@ -286,10 +286,111 @@
     return indices;
   }
 
+  function toMutationArray(records = []) {
+    try {
+      return Array.from(records || []);
+    } catch {
+      return [];
+    }
+  }
+
+  function toNodeArray(nodes = []) {
+    try {
+      return Array.from(nodes || []);
+    } catch {
+      return [];
+    }
+  }
+
+  function canSearchNode(node) {
+    if (!node) return false;
+    const type = Number(node.nodeType);
+    return type === 1 || type === 11 || typeof node.matches === 'function' || typeof node.querySelector === 'function';
+  }
+
+  function nodeIsTurn(node) {
+    if (!canSearchNode(node)) return false;
+    try {
+      if (typeof node.matches === 'function' && node.matches('[data-turn-id]')) return true;
+    } catch {}
+    try {
+      if (node.dataset && node.dataset.turnId) return true;
+    } catch {}
+    return false;
+  }
+
+  function nodeContainsTurn(node) {
+    if (!canSearchNode(node)) return false;
+    if (nodeIsTurn(node)) return true;
+    try {
+      return !!node.querySelector?.('[data-turn-id]');
+    } catch {
+      return false;
+    }
+  }
+
+  function closestTurnForNode(node) {
+    if (!node) return null;
+    let candidate = node;
+    const type = Number(candidate.nodeType);
+    if (type !== 1) candidate = candidate.parentElement || candidate.parentNode || null;
+    try {
+      const closest = candidate?.closest?.('[data-turn-id]');
+      if (closest) return closest;
+    } catch {}
+    return nodeIsTurn(candidate) ? candidate : null;
+  }
+
+  function mutationHasTurnStructureChange(record) {
+    if (!record) return false;
+    if (record.type === 'attributes') {
+      const attributeName = String(record.attributeName || '');
+      return (attributeName === 'data-turn-id' || attributeName === 'data-turn') && nodeContainsTurn(record.target);
+    }
+
+    const added = toNodeArray(record.addedNodes);
+    for (const node of added) {
+      if (nodeContainsTurn(node)) return true;
+    }
+
+    const removed = toNodeArray(record.removedNodes);
+    for (const node of removed) {
+      if (nodeContainsTurn(node)) return true;
+    }
+
+    return false;
+  }
+
+  function mutationHasTurnContentChange(record) {
+    if (!record) return false;
+    return !!closestTurnForNode(record.target);
+  }
+
+  function classifyTimelineMutationRecords(records = []) {
+    const mutations = toMutationArray(records);
+    let needsSummaryRefresh = false;
+
+    for (const record of mutations) {
+      if (mutationHasTurnStructureChange(record)) {
+        return {
+          needsRebuild: true,
+          needsSummaryRefresh: false
+        };
+      }
+      if (mutationHasTurnContentChange(record)) needsSummaryRefresh = true;
+    }
+
+    return {
+      needsRebuild: false,
+      needsSummaryRefresh
+    };
+  }
+
   return {
     evaluateInitialJumpReadiness,
     evaluateScrollCorrection,
     calculateTimelineContentHeight,
+    classifyTimelineMutationRecords,
     mapLiveReferenceToVisualRatio,
     normalizeMarkerRatios,
     shouldRunTimelineJump,

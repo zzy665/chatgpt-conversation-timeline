@@ -93,8 +93,28 @@ html.dark, body.dark, html[data-theme="dark"], [data-theme="dark"], [data-color-
     position: relative;
     width: 100%;
     height: 100%;
-    overflow-y: auto; /* programmatic scroll in Linked mode */
-    overflow-x: hidden; /* prevent horizontal wobble */
+    overflow: hidden !important;
+    overflow-y: hidden !important;
+    overflow-x: hidden !important;
+    scrollbar-width: none !important;
+    -ms-overflow-style: none !important;
+    scrollbar-gutter: auto !important;
+}
+
+.timeline-track::-webkit-scrollbar,
+.timeline-track::-webkit-scrollbar-button,
+.timeline-track::-webkit-scrollbar-thumb,
+.timeline-track::-webkit-scrollbar-track,
+.timeline-track-content::-webkit-scrollbar,
+.timeline-track-content::-webkit-scrollbar-button,
+.timeline-track-content::-webkit-scrollbar-thumb,
+.timeline-track-content::-webkit-scrollbar-track {
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    background: transparent !important;
 }
 
 /* Inner content whose height reflects conversation length */
@@ -102,7 +122,12 @@ html.dark, body.dark, html[data-theme="dark"], [data-theme="dark"], [data-color-
     position: relative;
     width: 100%;
     height: 100%; /* updated by JS when needed */
-    overflow-x: hidden;
+    overflow: hidden !important;
+    overflow-x: hidden !important;
+    overflow-y: hidden !important;
+    scrollbar-width: none !important;
+    -ms-overflow-style: none !important;
+    scrollbar-gutter: auto !important;
 }
 
 .timeline-dot {
@@ -368,83 +393,3 @@ html[data-theme="dark"] .timeline-tooltip-answer,
     border-right: none;
     border-top: none;
 }
-
-/* Hide native scrollbar of the track */
-.timeline-track::-webkit-scrollbar { width: 0; height: 0; }
-.timeline-track { scrollbar-width: none; }
-
-/* Left-side slider to control timeline scroll (visual, low-key) */
-.timeline-slider {
-    position: absolute;
-    left: 2px;
-    top: var(--timeline-track-padding);
-    bottom: var(--timeline-track-padding);
-    width: 6px;
-    pointer-events: auto; /* allow handle to capture */
-    opacity: 0;
-    transition: opacity 180ms ease;
-    z-index: 10;
-}
-.timeline-slider.visible { opacity: 1; }
-.timeline-slider::before {
-    content: '';
-    position: absolute;
-    left: 2px;
-    top: 0; bottom: 0;
-    width: 2px;
-    background: rgba(0,0,0,0.08);
-    border-radius: 9999px;
-}
-html.dark .timeline-slider::before { background: rgba(255,255,255,0.10); }
-
-.timeline-slider .timeline-handle {
-    position: absolute;
-    left: 0;
-    width: 6px;
-    height: 24px; /* updated by JS */
-    background: rgba(16,163,127,0.28); /* ChatGPT green with low opacity */
-    border-radius: 9999px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.15);
-    pointer-events: auto;
-    cursor: grab;
-    transition: background-color 120ms ease, opacity 120ms ease;
-}
-.timeline-slider .timeline-handle:hover { background: rgba(16,163,127,0.45); }
-.timeline-slider .timeline-handle:active { cursor: grabbing; }
-/* External left-side slider (outside the timeline bar) */
-.timeline-left-slider {
-    position: fixed;
-    /* left set by JS using bar's rect (to the left of the bar) */
-    top: 0; /* updated by JS */
-    width: 12px; /* hit area; visual line narrower */
-    height: 160px; /* updated by JS */
-    opacity: 0;
-    transition: opacity 180ms ease;
-    z-index: 2147483646; /* align with bar */
-    pointer-events: none;
-}
-.timeline-left-slider.visible { opacity: 1;  pointer-events: auto; }
-.timeline-left-slider::before {
-    content: '';
-    position: absolute;
-    left: 5px; /* center thin track inside 12px hit area */
-    top: 0; bottom: 0;
-    width: 2px;
-    background: rgba(0,0,0,0.08);
-    border-radius: 9999px;
-}
-html.dark .timeline-left-slider::before { background: rgba(255,255,255,0.10); }
-.timeline-left-slider .timeline-left-handle {
-    position: absolute;
-    left: 2px; /* centered for 8px width inside 12px hit area */
-    width: 8px;
-    height: 22px; /* fixed, concise */
-    background: rgba(16,163,127,0.28);
-    border-radius: 9999px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.15);
-    pointer-events: auto;
-    cursor: grab;
-    transition: background-color 120ms ease;
-}
-.timeline-left-slider .timeline-left-handle:hover { background: rgba(16,163,127,0.45); }
-.timeline-left-slider .timeline-left-handle:active { cursor: grabbing; }

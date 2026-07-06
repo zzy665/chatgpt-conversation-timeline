@@ -12,6 +12,7 @@ const {
   resolveScrollFocusOffset,
   resolveScrollTarget,
   shouldRunTimelineJump,
+  classifyTimelineMutationRecords,
   selectActiveIndex,
   selectNearestIndexByY,
   selectHoverPaintIndices
@@ -25,6 +26,56 @@ function run(name, fn) {
     console.error(`not ok - ${name}`);
     throw error;
   }
+}
+
+function fakeTurnElement(turn = 'user', turnId = `${turn}-1`) {
+  return {
+    nodeType: 1,
+    dataset: { turn, turnId },
+    matches(selector) {
+      return selector === '[data-turn-id]';
+    },
+    querySelector() {
+      return null;
+    },
+    closest(selector) {
+      return selector === '[data-turn-id]' ? this : null;
+    }
+  };
+}
+
+function fakeChildInsideTurn(turn = 'assistant') {
+  const parentTurn = fakeTurnElement(turn, `${turn}-parent`);
+  return {
+    nodeType: 1,
+    dataset: {},
+    matches() {
+      return false;
+    },
+    querySelector() {
+      return null;
+    },
+    closest(selector) {
+      return selector === '[data-turn-id]' ? parentTurn : null;
+    }
+  };
+}
+
+function fakeWrapperWithNestedTurn(turn = 'user') {
+  const nestedTurn = turn ? fakeTurnElement(turn, `${turn}-nested`) : null;
+  return {
+    nodeType: 1,
+    dataset: {},
+    matches() {
+      return false;
+    },
+    querySelector(selector) {
+      return selector === '[data-turn-id]' ? nestedTurn : null;
+    },
+    closest() {
+      return null;
+    }
+  };
 }
 
 run('evaluateInitialJumpReadiness keeps initial jumps blocked while layout metrics move', () => {
@@ -249,6 +300,54 @@ run('calculateTimelineContentHeight keeps the viewport height when proportional 
     minGap: 24,
     markerRatios: [0, 0.25, 0.5, 0.75, 1]
   }), 651);
+});
+
+run('classifyTimelineMutationRecords rebuilds when a user turn node appears', () => {
+  assert.deepEqual(classifyTimelineMutationRecords([{
+    type: 'childList',
+    target: {},
+    addedNodes: [fakeTurnElement('user', 'turn-2')],
+    removedNodes: []
+  }]), {
+    needsRebuild: true,
+    needsSummaryRefresh: false
+  });
+});
+
+run('classifyTimelineMutationRecords treats assistant streaming as summary-only work', () => {
+  assert.deepEqual(classifyTimelineMutationRecords([{
+    type: 'childList',
+    target: fakeChildInsideTurn('assistant'),
+    addedNodes: [{ nodeType: 3 }],
+    removedNodes: []
+  }]), {
+    needsRebuild: false,
+    needsSummaryRefresh: true
+  });
+});
+
+run('classifyTimelineMutationRecords rebuilds when a wrapper containing turns is removed', () => {
+  assert.deepEqual(classifyTimelineMutationRecords([{
+    type: 'childList',
+    target: {},
+    addedNodes: [],
+    removedNodes: [fakeWrapperWithNestedTurn('user')]
+  }]), {
+    needsRebuild: true,
+    needsSummaryRefresh: false
+  });
+});
+
+run('classifyTimelineMutationRecords ignores decoration outside turns', () => {
+  assert.deepEqual(classifyTimelineMutationRecords([{
+    type: 'childList',
+    target: {},
+    addedNodes: [fakeWrapperWithNestedTurn(null)],
+    removedNodes: []
+  }]), {
+    needsRebuild: false,
+    needsSummaryRefresh: false
+  });
 });
 
 run('selectNearestIndexByY chooses the closest timeline position', () => {
